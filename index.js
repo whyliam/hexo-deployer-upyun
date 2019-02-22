@@ -31,12 +31,15 @@ hexo.extend.deployer.register('upyun', async function (args) {
   try {
     let public_dir = path.join(this.base_dir, this.config.public_dir);
 
-    if (!args.bucket || !args.operator || !args.password || !args.endpoint || !args.secret) {
+    let upyun_operator = process.env.upyun_operator || args.operator;
+    let upyun_password = process.env.upyun_password || args.password;
+
+    if (!args.bucket || !upyun_operator || !upyun_password || !args.endpoint || !args.secret) {
       console.log('Please check your config.');
       return;
     }
-
-    let upyun = new UpYun(args.bucket, args.operator, args.password, args.endpoint, {
+    
+    let upyun = new UpYun(args.bucket, upyun_operator, upyun_password, args.endpoint, {
       apiVersion: 'v2',
       secret: args.secret
     });
