@@ -197,8 +197,8 @@ hexo.extend.deployer.register('upyun', (() => {
       })();
 
       let public_dir = path.join(this.base_dir, this.config.public_dir);
-      let upyun_operator = process.env.upyun_operator || args.operator;
-      let upyun_password = process.env.upyun_password || args.password;
+      let upyun_operator = process.env.UPYUN_OPERATOR || args.operator;
+      let upyun_password = process.env.UPYUN_PASSWORD || args.password;
 
       if (!args.bucket || !upyun_operator || !upyun_password) {
         console.log('Please check your config.');
