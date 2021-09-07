@@ -1,6 +1,6 @@
 {
   "name": "hexo-deployer-upyun",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "UPYUN deployer for Hexo.",
   "main": "compiled.js",
   "scripts": {
@@ -13,10 +13,10 @@
   "author": "Menci",
   "license": "GPL-3.0",
   "dependencies": {
-    "bluebird": "^3.5.4",
-    "colors": "^1.3.3",
+    "bluebird": "^3.7.2",
+    "colors": "^1.4.0",
     "md5": "^2.2.1",
-    "upyun": "^3.3.8"
+    "upyun": "^3.4.4"
   },
   "devDependencies": {
     "@babel/core": "^7.4.3",
