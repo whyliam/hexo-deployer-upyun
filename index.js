@@ -18,59 +18,83 @@
  */
 'use strict';
 
-let Promise = require('bluebird');
+const UpYun = require('upyun');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { promisify } = require('util');
 
-let UpYun = require('upyun');
+const readdir = promisify(fs.readdir);
+const readFile = promisify(fs.readFile);
+const stat = promisify(fs.stat);
 
-let fs = require('fs');
+function md5(content) {
+  return crypto.createHash('md5').update(content).digest('hex');
+}
 
-Promise.promisifyAll(fs);
+function color(code, text) {
+  return `\u001b[${code}m${text}\u001b[39m`;
+}
 
-let path = require('path');
+function green(text) {
+  return color(32, text);
+}
 
-let md5 = require('md5');
+function yellow(text) {
+  return color(33, text);
+}
 
-require('colors');
+function magenta(text) {
+  return color(35, text);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getIgnoreRegExp(args, type) {
+  let pattern = args.ignore_path_re && args.ignore_path_re[type];
+  return pattern ? new RegExp(pattern) : /a^/;
+}
 
 hexo.extend.deployer.register('upyun', async function (args) {
   try {
     let public_dir = path.join(this.base_dir, this.config.public_dir);
-    let upyun_operator = process.env.upyun_operator || args.operator;
-    let upyun_password = process.env.upyun_password || args.password;
+    let upyun_operator = process.env.UPYUN_OPERATOR || process.env.upyun_operator || args.operator;
+    let upyun_password = process.env.UPYUN_PASSWORD || process.env.upyun_password || args.password;
 
     if (!args.bucket || !upyun_operator || !upyun_password) {
       console.log('Please check your config.');
       return;
     }
 
-    let service = new UpYun.Service(args.bucket, upyun_operator, upyun_password)
+    let service = new UpYun.Service(args.bucket, upyun_operator, upyun_password);
     let client = new UpYun.Client(service);
-    Promise.promisifyAll(client); // Get remote file list
 
     async function getRemoteList() {
       let data = await client.getFile('.file_list.json', null);
-      if (data != undefined) {
-        return data;
-      } else if (data == false) {
+      if (data === false) {
         return [];
+      } else if (data != undefined) {
+        return data;
       } else throw data;
     }
 
     let remoteList = await getRemoteList();
-    let ignoreFileRE = new RegExp(args.ignore_path_re.file);
-    let ignoreDirRE = new RegExp(args.ignore_path_re.dir); // Get local file list
+    let ignoreFileRE = getIgnoreRegExp(args, 'file');
+    let ignoreDirRE = getIgnoreRegExp(args, 'dir');
 
     async function getLocalList(dir) {
-      let list = await fs.readdirAsync(dir),
-        res = [];
+      let list = await readdir(dir);
+      let res = [];
 
       for (let name of list) {
         let fillPath = path.join(dir, name);
-        let stats = await fs.statAsync(fillPath);
+        let stats = await stat(fillPath);
 
         if (stats.isFile()) {
           if (ignoreFileRE.test(fillPath)) continue;
-          let content = await fs.readFileAsync(fillPath);
+          let content = await readFile(fillPath);
           let md5sum = md5(content);
           res.push({
             name: name,
@@ -91,27 +115,25 @@ hexo.extend.deployer.register('upyun', async function (args) {
       return res;
     }
 
-    let localList = await getLocalList(public_dir); // Get diff list
+    let localList = await getLocalList(public_dir);
 
     function getDiffList(remoteList, localList) {
-      let removeList = [],
-        putList = [],
-        removeDirList = [],
-        mkdirList = []; // Determine which files to remote and put
+      let removeList = [];
+      let putList = [];
+      let removeDirList = [];
+      let mkdirList = [];
 
       let remoteFiles = remoteList.filter(x => x.type === 'file');
       let localFiles = localList.filter(x => x.type === 'file');
 
       for (let remote of remoteFiles) {
-        // For a remote file, find it in local files
-        let index = localFiles.findIndex(x => x.name === remote.name),
-          local = index === -1 ? null : localFiles[index];
+        let index = localFiles.findIndex(x => x.name === remote.name);
+        let local = index === -1 ? null : localFiles[index];
 
         if (local) {
           localFiles.splice(index, 1);
 
           if (local.md5sum === remote.md5sum) {
-            // Not modified
             continue;
           } else {
             putList.push(local.name);
@@ -119,13 +141,11 @@ hexo.extend.deployer.register('upyun', async function (args) {
         } else {
           removeList.push(remote.name);
         }
-      } // The local files that wasn't matched by a remote file should be put
-
+      }
 
       if (localFiles.length) {
         putList = putList.concat(localFiles.map(x => x.name));
-      } // Determine what dirs to remote or make
-
+      }
 
       let remoteDirs = remoteList.filter(x => x.type === 'dir');
       let localDirs = localList.filter(x => x.type === 'dir');
@@ -142,23 +162,20 @@ hexo.extend.deployer.register('upyun', async function (args) {
       }
 
       for (let remote of remoteDirs) {
-        // For a remote dir, find it in local dirs
-        let index = localDirs.findIndex(x => x.name === remote.name),
-          local = index === -1 ? null : localDirs[index];
+        let index = localDirs.findIndex(x => x.name === remote.name);
+        let local = index === -1 ? null : localDirs[index];
 
         if (local) {
-          localDirs.splice(index, 1); // Get diff of files and dirs in the dir
+          localDirs.splice(index, 1);
 
           let subLists = getDiffList(remote.subItems, local.subItems);
           concatSubItems(subLists, remote.name);
         } else {
-          // Get diff of files and dirs in the dir
           let subLists = getDiffList(remote.subItems, []);
           concatSubItems(subLists, remote.name);
           removeDirList.push(remote.name);
         }
-      } // The local dirs that wasn't matched by a remote dir should be make and put
-
+      }
 
       if (localDirs.length) {
         for (let local of localDirs) {
@@ -182,42 +199,42 @@ hexo.extend.deployer.register('upyun', async function (args) {
       };
     }
 
-    let lists = getDiffList(remoteList, localList); // Process the lists
+    let lists = getDiffList(remoteList, localList);
 
     async function processRemove(removeList) {
       for (let file of removeList) {
         let data = await client.deleteFile(file);
 
         if (data == true) {
-          console.log('INFO '.green + ` Removed file ${file.magenta} successfully`);
+          console.log(green('INFO ') + ` Removed file ${magenta(file)} successfully`);
         } else if (data == false) {
-          console.log('WARN '.yellow + ` Error removing file ${file.magenta} - 404`);
+          console.log(yellow('WARN ') + ` Error removing file ${magenta(file)} - 404`);
         } else throw ['processRemove', file, data];
       }
     }
 
     async function processRemoveDir(removeDirList) {
-      // Sometimes if we remove a dir just after removing the inside files,
-      // we got 'directory not empty', so let's try 5 times before throw an
-      // fatel error.
+      // Sometimes the remote API reports "directory not empty" immediately
+      // after deleting child files, so retry before surfacing a fatal error.
       for (let dir of removeDirList) {
         let try_times = parseInt(args.try_times) || 5;
         let success = false;
+        let data;
 
         while (try_times--) {
-          let data = await client.deleteFile(dir);
+          data = await client.deleteFile(dir);
 
           if (data == true) {
-            console.log('INFO '.green + ` Removed dir ${dir.magenta} successfully`);
+            console.log(green('INFO ') + ` Removed dir ${magenta(dir)} successfully`);
             success = true;
             break;
           } else if (data == false) {
-            console.log('WARN '.yellow + ` Error removing dir ${dir.magenta} - 404`);
+            console.log(yellow('WARN ') + ` Error removing dir ${magenta(dir)} - 404`);
             success = true;
             break;
           }
 
-          await Promise.delay(500);
+          await sleep(500);
         }
 
         if (!success) throw ['processRemoveDir', dir, data];
@@ -229,20 +246,18 @@ hexo.extend.deployer.register('upyun', async function (args) {
         let data = await client.makeDir(dir);
 
         if (data == true) {
-          console.log('INFO '.green + ` Make dir ${dir.magenta} successfully`);
+          console.log(green('INFO ') + ` Make dir ${magenta(dir)} successfully`);
         } else throw ['processMkdir', dir, data];
       }
     }
 
     async function processPut(putList) {
       for (let file of putList) {
-        let mimeType = null;
-        if (path.extname(file) === '') mimeType = 'text/html';
-        let fileContent = await fs.readFileAsync(path.resolve(public_dir, file));
+        let fileContent = await readFile(path.resolve(public_dir, file));
         let data = await client.putFile(file, fileContent);
 
         if (data == true) {
-          console.log('INFO '.green + ` Put file ${file.magenta} successfully`);
+          console.log(green('INFO ') + ` Put file ${magenta(file)} successfully`);
         } else throw ['processPut', file, data];
       }
     }
@@ -251,7 +266,7 @@ hexo.extend.deployer.register('upyun', async function (args) {
       let data = await client.putFile('.file_list.json', Buffer.from(JSON.stringify(fileList)));
 
       if (data == true) {
-        console.log('INFO '.green + ' Put new file list successfully');
+        console.log(green('INFO ') + ' Put new file list successfully');
       } else throw ['putFileList', data];
     }
 
@@ -260,8 +275,8 @@ hexo.extend.deployer.register('upyun', async function (args) {
     await processMkdir(lists.mkdirList);
     await processPut(lists.putList);
     await putFileList(localList);
-  } catch (e) {
-    console.log('ERROR'.red + ' The error message is below');
-    console.log(e);
+  } catch (err) {
+    console.log(err);
+    throw err;
   }
 });
