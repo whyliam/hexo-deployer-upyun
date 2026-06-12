@@ -33,6 +33,9 @@ build/Release
 node_modules
 jspm_packages
 
+# Lock files (library should not commit lock files)
+package-lock.json
+
 # Optional npm cache directory
 .npm
 

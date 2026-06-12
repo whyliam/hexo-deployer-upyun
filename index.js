@@ -1,300 +1,369 @@
-/*
- *  This file is part of hexo-deployer-upyun.
- *
- *  Copyright (c) 2016 Menci <huanghaorui301@gmail.com>
- *
- *  hexo-deployer-upyun is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, either version 3 of the License, or
- *  (at your option) any later version.
- *
- *  hexo-deployer-upyun is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with hexo-deployer-upyun. If not, see <http://www.gnu.org/licenses/>.
- */
 'use strict';
 
 const UpYun = require('upyun');
-const fs = require('fs');
+const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
-const { promisify } = require('util');
-
-const readdir = promisify(fs.readdir);
-const readFile = promisify(fs.readFile);
-const stat = promisify(fs.stat);
 
 function md5(content) {
   return crypto.createHash('md5').update(content).digest('hex');
 }
 
-function color(code, text) {
-  return `\u001b[${code}m${text}\u001b[39m`;
-}
-
-function green(text) {
-  return color(32, text);
-}
-
-function yellow(text) {
-  return color(33, text);
-}
-
-function magenta(text) {
-  return color(35, text);
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function getIgnoreRegExp(args, type) {
-  let pattern = args.ignore_path_re && args.ignore_path_re[type];
+  const pattern = args.ignore_path_re && args.ignore_path_re[type];
   return pattern ? new RegExp(pattern) : /a^/;
 }
 
-hexo.extend.deployer.register('upyun', async function (args) {
-  try {
-    let public_dir = path.join(this.base_dir, this.config.public_dir);
-    let upyun_operator = process.env.UPYUN_OPERATOR || process.env.upyun_operator || args.operator;
-    let upyun_password = process.env.UPYUN_PASSWORD || process.env.upyun_password || args.password;
-
-    if (!args.bucket || !upyun_operator || !upyun_password) {
-      console.log('Please check your config.');
-      return;
+async function withRetry(fn, retries, log) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === retries) throw err;
+      const delay = Math.min(1000 * Math.pow(2, i), 10000);
+      log.warn(`Retry ${i + 1}/${retries} after ${delay}ms: ${err.message || err}`);
+      await new Promise(r => setTimeout(r, delay));
     }
+  }
+}
 
-    let service = new UpYun.Service(args.bucket, upyun_operator, upyun_password);
-    let client = new UpYun.Client(service);
+async function runConcurrent(tasks, concurrency, onProgress) {
+  let completed = 0;
+  let failed = 0;
+  const failures = [];
+  const total = tasks.length;
 
-    async function getRemoteList() {
-      let data = await client.getFile('.file_list.json', null);
+  for (let i = 0; i < tasks.length; i += concurrency) {
+    const batch = tasks.slice(i, i + concurrency);
+    const results = await Promise.allSettled(batch.map(t => t()));
+    for (const r of results) {
+      if (r.status === 'fulfilled') completed++;
+      else {
+        failed++;
+        failures.push(r.reason);
+      }
+    }
+    if (onProgress) onProgress(completed, failed, total);
+  }
+  return { completed, failed, failures };
+}
+
+function humanSize(bytes) {
+  if (bytes < 1024) return bytes + 'B';
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + 'KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+}
+
+hexo.extend.deployer.register('upyun', async function (args) {
+  const log = this.log || hexo.log;
+  const public_dir = path.join(this.base_dir, this.config.public_dir);
+  const concurrency = parseInt(args.concurrency) || 10;
+  const retries = parseInt(args.try_times) || 3;
+  const force = args.force || process.env.UPYUN_FORCE === '1';
+
+  // 1. Validate config & init client
+  const upyun_operator = process.env.UPYUN_OPERATOR || args.operator;
+  const upyun_password = process.env.UPYUN_PASSWORD || args.password;
+
+  if (!args.bucket || !upyun_operator || !upyun_password) {
+    log.error('Missing UPYUN config. Please set bucket, operator and password.');
+    return;
+  }
+
+  const service = new UpYun.Service(args.bucket, upyun_operator, upyun_password);
+  const client = new UpYun.Client(service);
+
+  // 2. Fetch remote .file_list.json (fault-tolerant)
+  let remoteList = [];
+  if (!force) {
+    try {
+      const data = await client.getFile('.file_list.json', null);
       if (data === false) {
-        // File does not exist on remote — treat as empty (first deploy)
-        return [];
-      } else if (data != undefined) {
-        // data is the raw file content (string); parse it as JSON
+        log.info('No remote .file_list.json found, will do full upload.');
+      } else if (data != null) {
         if (typeof data === 'string' || Buffer.isBuffer(data)) {
           try {
-            return JSON.parse(data);
+            remoteList = JSON.parse(data);
           } catch (e) {
-            console.log(yellow('WARN ') + ' .file_list.json is corrupted, treating as empty');
-            return [];
+            log.warn('.file_list.json is corrupted, falling back to full upload.');
+            remoteList = [];
           }
+        } else if (Array.isArray(data)) {
+          remoteList = data;
+        } else {
+          log.warn('Unexpected response from getFile, falling back to full upload.');
+          remoteList = [];
         }
-        // If data is already an array (unlikely but safe)
-        if (Array.isArray(data)) {
-          return data;
+      }
+    } catch (err) {
+      log.warn(`Failed to fetch remote .file_list.json: ${err.message || err}, falling back to full upload.`);
+      remoteList = [];
+    }
+  } else {
+    log.info('Force mode enabled, skipping incremental diff.');
+  }
+
+  // 3. Scan local public directory & compute MD5
+  const ignoreFileRE = getIgnoreRegExp(args, 'file');
+  const ignoreDirRE = getIgnoreRegExp(args, 'dir');
+
+  async function getLocalList(dir) {
+    const entries = await fs.readdir(dir);
+    const res = [];
+
+    for (const name of entries) {
+      const fullPath = path.join(dir, name);
+      const stats = await fs.stat(fullPath);
+
+      if (stats.isFile()) {
+        if (ignoreFileRE.test(fullPath)) continue;
+        const content = await fs.readFile(fullPath);
+        res.push({ name, type: 'file', md5sum: md5(content) });
+      } else if (stats.isDirectory()) {
+        if (ignoreDirRE.test(fullPath)) continue;
+        const subItems = await getLocalList(fullPath);
+        res.push({ name, type: 'dir', subItems });
+      }
+    }
+
+    return res;
+  }
+
+  const localList = await getLocalList(public_dir);
+
+  // 4. Compute diff (or skip in force mode)
+  function getDiffList(remoteList, localList) {
+    let removeList = [];
+    let putList = [];
+    let removeDirList = [];
+    let mkdirList = [];
+
+    const remoteFiles = remoteList.filter(x => x.type === 'file');
+    const localFiles = localList.filter(x => x.type === 'file');
+
+    for (const remote of remoteFiles) {
+      const index = localFiles.findIndex(x => x.name === remote.name);
+      const local = index === -1 ? null : localFiles[index];
+
+      if (local) {
+        localFiles.splice(index, 1);
+        if (local.md5sum !== remote.md5sum) {
+          putList.push(local.name);
         }
-        return [];
       } else {
-        // Unexpected response — treat as empty to allow full upload
-        console.log(yellow('WARN ') + ' Unexpected response from getFile, treating remote as empty');
-        return [];
+        removeList.push(remote.name);
       }
     }
 
-    let remoteList = await getRemoteList();
-    let ignoreFileRE = getIgnoreRegExp(args, 'file');
-    let ignoreDirRE = getIgnoreRegExp(args, 'dir');
+    if (localFiles.length) {
+      putList = putList.concat(localFiles.map(x => x.name));
+    }
 
-    async function getLocalList(dir) {
-      let list = await readdir(dir);
-      let res = [];
+    const remoteDirs = remoteList.filter(x => x.type === 'dir');
+    const localDirs = localList.filter(x => x.type === 'dir');
 
-      for (let name of list) {
-        let fillPath = path.join(dir, name);
-        let stats = await stat(fillPath);
+    function concatSubItems(subLists, prefixPath) {
+      function joinPrefix(list) {
+        return list.map(x => path.join(prefixPath, x));
+      }
+      removeList = removeList.concat(joinPrefix(subLists.removeList));
+      putList = putList.concat(joinPrefix(subLists.putList));
+      removeDirList = removeDirList.concat(joinPrefix(subLists.removeDirList));
+      mkdirList = mkdirList.concat(joinPrefix(subLists.mkdirList));
+    }
 
-        if (stats.isFile()) {
-          if (ignoreFileRE.test(fillPath)) continue;
-          let content = await readFile(fillPath);
-          let md5sum = md5(content);
-          res.push({
-            name: name,
-            type: 'file',
-            md5sum: md5sum
-          });
-        } else if (stats.isDirectory()) {
-          if (ignoreDirRE.test(fillPath)) continue;
-          let subItems = await getLocalList(fillPath);
-          res.push({
-            name: name,
-            type: 'dir',
-            subItems: subItems
-          });
+    for (const remote of remoteDirs) {
+      const index = localDirs.findIndex(x => x.name === remote.name);
+      const local = index === -1 ? null : localDirs[index];
+
+      if (local) {
+        localDirs.splice(index, 1);
+        const subLists = getDiffList(remote.subItems, local.subItems);
+        concatSubItems(subLists, remote.name);
+      } else {
+        const subLists = getDiffList(remote.subItems, []);
+        concatSubItems(subLists, remote.name);
+        removeDirList.push(remote.name);
+      }
+    }
+
+    if (localDirs.length) {
+      for (const local of localDirs) {
+        mkdirList.push(local.name);
+        const subLists = getDiffList([], local.subItems);
+        concatSubItems(subLists, local.name);
+      }
+    }
+
+    function getDirDepth(dir) {
+      return dir.split('/').length;
+    }
+
+    mkdirList.sort((a, b) => getDirDepth(a) - getDirDepth(b));
+    removeDirList.sort((a, b) => getDirDepth(b) - getDirDepth(a));
+
+    return { removeList, putList, removeDirList, mkdirList };
+  }
+
+  const lists = force
+    ? { removeList: [], putList: [], removeDirList: [], mkdirList: [] }
+    : getDiffList(remoteList, localList);
+
+  // In force mode, build putList/mkdirList from localList recursively
+  if (force) {
+    function collectAll(items, prefix) {
+      for (const item of items) {
+        const p = prefix ? path.join(prefix, item.name) : item.name;
+        if (item.type === 'file') {
+          lists.putList.push(p);
+        } else if (item.type === 'dir') {
+          lists.mkdirList.push(p);
+          collectAll(item.subItems, p);
         }
       }
-
-      return res;
     }
+    collectAll(localList, '');
+    lists.mkdirList.sort((a, b) => a.split('/').length - b.split('/').length);
+  }
 
-    let localList = await getLocalList(public_dir);
+  // Count total operations for progress
+  const totalOps = lists.removeList.length + lists.removeDirList.length
+    + lists.mkdirList.length + lists.putList.length;
 
-    function getDiffList(remoteList, localList) {
-      let removeList = [];
-      let putList = [];
-      let removeDirList = [];
-      let mkdirList = [];
+  if (totalOps === 0) {
+    log.info('No changes detected. Deployment is up to date.');
+    return;
+  }
 
-      let remoteFiles = remoteList.filter(x => x.type === 'file');
-      let localFiles = localList.filter(x => x.type === 'file');
+  log.info(`Deploying to UPYUN: ${lists.putList.length} uploads, ${lists.removeList.length} deletes, `
+    + `${lists.mkdirList.length} mkdirs, ${lists.removeDirList.length} rmdirs, concurrency=${concurrency}`);
 
-      for (let remote of remoteFiles) {
-        let index = localFiles.findIndex(x => x.name === remote.name);
-        let local = index === -1 ? null : localFiles[index];
+  let progressCount = 0;
+  const allFailures = [];
 
-        if (local) {
-          localFiles.splice(index, 1);
+  function makeProgressHandler(category) {
+    return function onDone(completed, failed, total) {
+      progressCount = progressCount; // batch-level tracking below
+    };
+  }
 
-          if (local.md5sum === remote.md5sum) {
-            continue;
-          } else {
-            putList.push(local.name);
-          }
-        } else {
-          removeList.push(remote.name);
+  // 5a. Delete files (concurrent with retry)
+  if (lists.removeList.length > 0) {
+    log.info(`Deleting ${lists.removeList.length} remote files...`);
+    const tasks = lists.removeList.map(file => () =>
+      withRetry(async () => {
+        const data = await client.deleteFile(file);
+        if (data !== true && data !== false) throw new Error(`deleteFile returned unexpected: ${data}`);
+      }, retries, log).then(() => {
+        progressCount++;
+        if (progressCount % 100 === 0 || progressCount === totalOps) {
+          log.info(`[${String(progressCount).padStart(4)}/${totalOps}] Deleted ${file}`);
         }
-      }
+      }).catch(err => {
+        progressCount++;
+        allFailures.push({ action: 'delete', file, error: err.message || err });
+        log.warn(`[${String(progressCount).padStart(4)}/${totalOps}] Failed to delete ${file}: ${err.message || err}`);
+      })
+    );
+    await runConcurrent(tasks, concurrency, () => {});
+  }
 
-      if (localFiles.length) {
-        putList = putList.concat(localFiles.map(x => x.name));
-      }
-
-      let remoteDirs = remoteList.filter(x => x.type === 'dir');
-      let localDirs = localList.filter(x => x.type === 'dir');
-
-      function concatSubItems(subLists, prefixPath) {
-        function joinPrefixPath(list) {
-          return list.map(x => path.join(prefixPath, x));
+  // 5b. Delete empty directories (sequential-ish, deepest first, with retry)
+  if (lists.removeDirList.length > 0) {
+    log.info(`Deleting ${lists.removeDirList.length} remote directories...`);
+    const tasks = lists.removeDirList.map(dir => () =>
+      withRetry(async () => {
+        const data = await client.deleteFile(dir);
+        if (data !== true && data !== false) throw new Error(`deleteDir returned unexpected: ${data}`);
+      }, retries, log).then(() => {
+        progressCount++;
+        if (progressCount % 100 === 0 || progressCount === totalOps) {
+          log.info(`[${String(progressCount).padStart(4)}/${totalOps}] Removed dir ${dir}`);
         }
+      }).catch(err => {
+        progressCount++;
+        allFailures.push({ action: 'rmdir', file: dir, error: err.message || err });
+        log.warn(`[${String(progressCount).padStart(4)}/${totalOps}] Failed to remove dir ${dir}: ${err.message || err}`);
+      })
+    );
+    await runConcurrent(tasks, concurrency, () => {});
+  }
 
-        removeList = removeList.concat(joinPrefixPath(subLists.removeList));
-        putList = putList.concat(joinPrefixPath(subLists.putList));
-        removeDirList = removeDirList.concat(joinPrefixPath(subLists.removeDirList));
-        mkdirList = mkdirList.concat(joinPrefixPath(subLists.mkdirList));
-      }
-
-      for (let remote of remoteDirs) {
-        let index = localDirs.findIndex(x => x.name === remote.name);
-        let local = index === -1 ? null : localDirs[index];
-
-        if (local) {
-          localDirs.splice(index, 1);
-
-          let subLists = getDiffList(remote.subItems, local.subItems);
-          concatSubItems(subLists, remote.name);
-        } else {
-          let subLists = getDiffList(remote.subItems, []);
-          concatSubItems(subLists, remote.name);
-          removeDirList.push(remote.name);
+  // 5c. Create new directories (shallowest first, with retry)
+  if (lists.mkdirList.length > 0) {
+    log.info(`Creating ${lists.mkdirList.length} directories...`);
+    const tasks = lists.mkdirList.map(dir => () =>
+      withRetry(async () => {
+        const data = await client.makeDir(dir);
+        if (data !== true) throw new Error(`makeDir returned unexpected: ${data}`);
+      }, retries, log).then(() => {
+        progressCount++;
+        if (progressCount % 100 === 0 || progressCount === totalOps) {
+          log.info(`[${String(progressCount).padStart(4)}/${totalOps}] Created dir ${dir}`);
         }
-      }
+      }).catch(err => {
+        progressCount++;
+        allFailures.push({ action: 'mkdir', file: dir, error: err.message || err });
+        log.warn(`[${String(progressCount).padStart(4)}/${totalOps}] Failed to create dir ${dir}: ${err.message || err}`);
+      })
+    );
+    await runConcurrent(tasks, concurrency, () => {});
+  }
 
-      if (localDirs.length) {
-        for (let local of localDirs) {
-          mkdirList.push(local.name);
-          let subLists = getDiffList([], local.subItems);
-          concatSubItems(subLists, local.name);
+  // 5d. Upload files (concurrent with retry, progress per file)
+  if (lists.putList.length > 0) {
+    log.info(`Uploading ${lists.putList.length} files...`);
+    const tasks = lists.putList.map(file => () =>
+      withRetry(async () => {
+        const filePath = path.resolve(public_dir, file);
+        const fileContent = await fs.readFile(filePath);
+        const data = await client.putFile(file, fileContent);
+        if (data !== true) throw new Error(`putFile returned unexpected: ${data}`);
+        return fileContent.length;
+      }, retries, log).then(size => {
+        progressCount++;
+        const sizeStr = humanSize(size);
+        if (progressCount % 100 === 0 || progressCount === totalOps) {
+          log.info(`[${String(progressCount).padStart(4)}/${totalOps}] Put ${file} (${sizeStr})`);
         }
-      }
+      }).catch(err => {
+        progressCount++;
+        allFailures.push({ action: 'put', file, error: err.message || err });
+        log.warn(`[${String(progressCount).padStart(4)}/${totalOps}] Failed to put ${file}: ${err.message || err}`);
+      })
+    );
+    await runConcurrent(tasks, concurrency, () => {});
+  }
 
-      function getDirDepth(dir) {
-        return dir.split('/').length;
-      }
+  // 6. Summary
+  const successCount = totalOps - allFailures.length;
+  log.info(`Deployment summary: ${successCount}/${totalOps} operations succeeded.`);
 
-      mkdirList.sort((a, b) => getDirDepth(a) - getDirDepth(b));
-      removeDirList.sort((a, b) => getDirDepth(b) - getDirDepth(a));
-      return {
-        removeList: removeList,
-        putList: putList,
-        removeDirList: removeDirList,
-        mkdirList: mkdirList
-      };
+  if (allFailures.length > 0) {
+    log.warn(`${allFailures.length} operations failed:`);
+    for (const f of allFailures) {
+      log.warn(`  [${f.action}] ${f.file}: ${f.error}`);
     }
 
-    let lists = getDiffList(remoteList, localList);
-
-    async function processRemove(removeList) {
-      for (let file of removeList) {
-        let data = await client.deleteFile(file);
-
-        if (data == true) {
-          console.log(green('INFO ') + ` Removed file ${magenta(file)} successfully`);
-        } else if (data == false) {
-          console.log(yellow('WARN ') + ` Error removing file ${magenta(file)} - 404`);
-        } else throw ['processRemove', file, data];
-      }
+    // 7. If there are failures, skip updating .file_list.json
+    const failRate = allFailures.length / totalOps;
+    if (failRate > 0.1) {
+      log.error(`Failure rate ${(failRate * 100).toFixed(1)}% exceeds 10% threshold. Deployment failed.`);
+      throw new Error(`UPYUN deployment failed: ${allFailures.length}/${totalOps} operations failed.`);
     }
 
-    async function processRemoveDir(removeDirList) {
-      // Sometimes the remote API reports "directory not empty" immediately
-      // after deleting child files, so retry before surfacing a fatal error.
-      for (let dir of removeDirList) {
-        let try_times = parseInt(args.try_times) || 5;
-        let success = false;
-        let data;
+    log.warn(`Failure rate ${(failRate * 100).toFixed(1)}% is within tolerance. Skipping .file_list.json update.`);
+    return;
+  }
 
-        while (try_times--) {
-          data = await client.deleteFile(dir);
-
-          if (data == true) {
-            console.log(green('INFO ') + ` Removed dir ${magenta(dir)} successfully`);
-            success = true;
-            break;
-          } else if (data == false) {
-            console.log(yellow('WARN ') + ` Error removing dir ${magenta(dir)} - 404`);
-            success = true;
-            break;
-          }
-
-          await sleep(500);
-        }
-
-        if (!success) throw ['processRemoveDir', dir, data];
-      }
-    }
-
-    async function processMkdir(mkdirList) {
-      for (let dir of mkdirList) {
-        let data = await client.makeDir(dir);
-
-        if (data == true) {
-          console.log(green('INFO ') + ` Make dir ${magenta(dir)} successfully`);
-        } else throw ['processMkdir', dir, data];
-      }
-    }
-
-    async function processPut(putList) {
-      for (let file of putList) {
-        let fileContent = await readFile(path.resolve(public_dir, file));
-        let data = await client.putFile(file, fileContent);
-
-        if (data == true) {
-          console.log(green('INFO ') + ` Put file ${magenta(file)} successfully`);
-        } else throw ['processPut', file, data];
-      }
-    }
-
-    async function putFileList(fileList) {
-      let data = await client.putFile('.file_list.json', Buffer.from(JSON.stringify(fileList)));
-
-      if (data == true) {
-        console.log(green('INFO ') + ' Put new file list successfully');
-      } else throw ['putFileList', data];
-    }
-
-    await processRemove(lists.removeList);
-    await processRemoveDir(lists.removeDirList);
-    await processMkdir(lists.mkdirList);
-    await processPut(lists.putList);
-    await putFileList(localList);
+  // 7. Update remote .file_list.json (only if all operations succeeded)
+  try {
+    await withRetry(async () => {
+      const data = await client.putFile('.file_list.json', Buffer.from(JSON.stringify(localList)));
+      if (data !== true) throw new Error(`putFile returned unexpected: ${data}`);
+    }, retries, log);
+    log.info('Updated remote .file_list.json successfully.');
   } catch (err) {
-    console.log(err);
-    throw err;
+    log.warn(`Failed to update .file_list.json: ${err.message || err}. Next deploy will re-upload all files.`);
   }
 });

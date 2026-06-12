@@ -1,16 +1,16 @@
 {
   "name": "hexo-deployer-upyun",
-  "version": "0.0.6",
-  "description": "UPYUN deployer for Hexo.",
-  "main": "compiled.js",
-  "scripts": {
-    "compile": "node -c index.js && node -c compiled.js"
+  "version": "1.0.0",
+  "description": "UPYUN deployer for Hexo with concurrent upload and retry.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
   },
   "repository": {
-    "url": "https://github.com/Menci/hexo-deployer-upyun",
+    "url": "https://github.com/whyliam/hexo-deployer-upyun",
     "type": "git"
   },
-  "author": "Menci",
+  "author": "Menci, Liam",
   "license": "GPL-3.0",
   "dependencies": {
     "upyun": "^3.4.6"
