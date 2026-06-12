@@ -74,10 +74,28 @@ hexo.extend.deployer.register('upyun', async function (args) {
     async function getRemoteList() {
       let data = await client.getFile('.file_list.json', null);
       if (data === false) {
+        // File does not exist on remote — treat as empty (first deploy)
         return [];
       } else if (data != undefined) {
-        return data;
-      } else throw data;
+        // data is the raw file content (string); parse it as JSON
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          try {
+            return JSON.parse(data);
+          } catch (e) {
+            console.log(yellow('WARN ') + ' .file_list.json is corrupted, treating as empty');
+            return [];
+          }
+        }
+        // If data is already an array (unlikely but safe)
+        if (Array.isArray(data)) {
+          return data;
+        }
+        return [];
+      } else {
+        // Unexpected response — treat as empty to allow full upload
+        console.log(yellow('WARN ') + ' Unexpected response from getFile, treating remote as empty');
+        return [];
+      }
     }
 
     let remoteList = await getRemoteList();
