@@ -45,3 +45,7 @@ deploy:
 ## License
 
 GPL-3.0
+
+## Image upload responses
+
+Version 1.0.1 accepts the UPYUN SDK image-metadata response as a successful upload, as well as the `true` response used for other files. This avoids retrying successfully uploaded PNG/JPEG files and prevents a stale incremental deployment manifest.

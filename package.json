@@ -1,6 +1,6 @@
 {
   "name": "hexo-deployer-upyun",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "UPYUN deployer for Hexo with concurrent upload and retry.",
   "main": "index.js",
   "engines": {
@@ -14,5 +14,13 @@
   "license": "GPL-3.0",
   "dependencies": {
     "upyun": "^3.4.6"
+  },
+  "scripts": {
+    "test": "node --test test/*.cjs"
+  },
+  "overrides": {
+    "upyun": {
+      "axios": "^0.34.0"
+    }
   }
 }

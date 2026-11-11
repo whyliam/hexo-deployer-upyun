@@ -4,6 +4,7 @@ const UpYun = require('upyun');
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const isUploadResult = require('./lib/upload-result');
 
 function md5(content) {
   return crypto.createHash('md5').update(content).digest('hex');
@@ -318,7 +319,7 @@ hexo.extend.deployer.register('upyun', async function (args) {
         const filePath = path.resolve(public_dir, file);
         const fileContent = await fs.readFile(filePath);
         const data = await client.putFile(file, fileContent);
-        if (data !== true) throw new Error(`putFile returned unexpected: ${data}`);
+        if (!isUploadResult(data)) throw new Error('putFile returned an unsuccessful upload result');
         return fileContent.length;
       }, retries, log).then(size => {
         progressCount++;
